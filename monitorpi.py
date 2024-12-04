@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import queue
 
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -55,10 +56,9 @@ class DataBase:
 
 # Clase para el servidor TCP
 class TCPServer(threading.Thread):
-    def __init__(self, db, update_callback):
+    def __init__(self, data_queue):
         threading.Thread.__init__(self)
-        self.db = db
-        self.update_callback = update_callback
+        self.data_queue = data_queue
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((SERVER_IP, SERVER_PORT))
         self.server_socket.listen(1)
@@ -104,9 +104,9 @@ class TCPServer(threading.Thread):
                 temperature = float(temp_str)
                 humidity = float(hum_str)
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.db.insert_data(timestamp, temperature, humidity)
+                # En lugar de insertar en la base de datos, ponemos los datos en la cola
+                self.data_queue.put((timestamp, temperature, humidity))
                 print(f"Datos recibidos: Temperatura={temperature}C, Humedad={humidity}%")
-                self.update_callback()
             except Exception as e:
                 print(f"Error al procesar DATA: {e}")
         elif message.startswith("STATS"):
@@ -118,12 +118,11 @@ class TCPServer(threading.Thread):
                     print(f"Datos procesados recibidos:")
                     print(f"  Temp Promedio={temp_avg}C, Temp Max={temp_max}C, Temp Min={temp_min}C")
                     print(f"  Hum Promedio={hum_avg}%, Hum Max={hum_max}%, Hum Min={hum_min}%")
-                    # Almacenar el promedio en la base de datos
+                    # Por simplicidad, almacenamos el promedio en la base de datos
                     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     temperature = float(temp_avg)
                     humidity = float(hum_avg)
-                    self.db.insert_data(timestamp, temperature, humidity)
-                    self.update_callback()
+                    self.data_queue.put((timestamp, temperature, humidity))
                 else:
                     print("Mensaje STATS con formato incorrecto")
             except Exception as e:
@@ -151,10 +150,11 @@ class TCPServer(threading.Thread):
 
 # Clase principal de la interfaz grafica
 class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
-    def __init__(self, db, server):
+    def __init__(self, db, server, data_queue):
         super().__init__()
         self.db = db
         self.server = server
+        self.data_queue = data_queue
         self.setWindowTitle("Monitor de Temperatura y Humedad")
         self.setGeometry(100, 100, 800, 600)
 
@@ -238,9 +238,9 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.canvas = FigureCanvas(self.figure)
         self.main_layout.addWidget(self.canvas, stretch=3)
 
-        # Timer para actualizar los datos automaticamente cada 2 segundos
+        # Timer para procesar la cola y actualizar los datos automaticamente cada 2 segundos
         self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.actualizar_datos)
+        self.timer.timeout.connect(self.process_data_queue)
         self.timer.start(2000)  # Actualizar cada 2 segundos
 
         # Actualizar los datos inicialmente al iniciar la aplicacion
@@ -265,6 +265,18 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
     def set_window(self):
         window = self.windowInput.value()
         self.server.send_command(f"SET_WINDOW {window}")
+
+    def process_data_queue(self):
+        # Procesa todos los elementos en la cola
+        while not self.data_queue.empty():
+            try:
+                timestamp, temperature, humidity = self.data_queue.get_nowait()
+                # Inserta los datos en la base de datos
+                self.db.insert_data(timestamp, temperature, humidity)
+            except queue.Empty:
+                break
+        # Después de procesar los datos, actualiza la interfaz
+        self.actualizar_datos()
 
     def actualizar_datos(self):
         # Obtener los datos de la base de datos
@@ -318,18 +330,20 @@ if __name__ == "__main__":
     # Inicializar la base de datos
     db = DataBase(DB_FILE)
 
-    # Iniciar el servidor TCP en un hilo separado
-    server = TCPServer(db, None)  # Estableceremos el callback despues
+    # Crear la cola para los datos
+    data_queue = queue.Queue()
 
-    # Crear e iniciar la aplicacion grafica
-    main_window = TemperatureHumidityMonitorApp(db, server)
-    server.update_callback = main_window.actualizar_datos
+    # Iniciar el servidor TCP en un hilo separado
+    server = TCPServer(data_queue)
     server.start()
+
+    # Crear e iniciar la aplicación gráfica
+    main_window = TemperatureHumidityMonitorApp(db, server, data_queue)
     main_window.show()
 
     # Manejar el cierre del programa
     try:
         sys.exit(app.exec_())
     except SystemExit:
-        print("Cerrando aplicacion...")
+        print("Cerrando aplicación...")
         server.stop()
