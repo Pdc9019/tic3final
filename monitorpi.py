@@ -3,12 +3,16 @@ import threading
 import sqlite3
 import datetime
 import sys
+import matplotlib
+matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 # Configuraciones del Servidor TCP
-SERVER_IP = "192.168.4.1"
+SERVER_IP = "0.0.0.0"  # Escuchar en todas las interfaces
 SERVER_PORT = 8888
 BUFFER_SIZE = 1024
 
@@ -41,13 +45,13 @@ class DataBase:
         ''', (timestamp, temperature, humidity))
         self.conn.commit()
 
-    def fetch_last_data(self, limit=10):
+    def fetch_last_data(self, limit=20):
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT timestamp, temperature, humidity FROM SensorData
             ORDER BY id DESC LIMIT ?
         ''', (limit,))
-        return cursor.fetchall()
+        return cursor.fetchall()[::-1]  # Revertir para orden cronologico
 
 # Clase para el servidor TCP
 class TCPServer(threading.Thread):
@@ -59,39 +63,98 @@ class TCPServer(threading.Thread):
         self.server_socket.bind((SERVER_IP, SERVER_PORT))
         self.server_socket.listen(1)
         self.running = True
+        self.client_socket = None
+        self.client_lock = threading.Lock()
 
     def run(self):
         print(f"Servidor TCP escuchando en {SERVER_IP}:{SERVER_PORT}")
         while self.running:
             client_socket, client_address = self.server_socket.accept()
             print(f"Conexion aceptada de {client_address}")
+            with self.client_lock:
+                self.client_socket = client_socket
             threading.Thread(target=self.handle_client, args=(client_socket,)).start()
 
     def handle_client(self, client_socket):
+        buffer = ""
         while True:
             try:
                 data = client_socket.recv(BUFFER_SIZE)
                 if not data:
                     break
-                temperature, humidity = map(float, data.decode().split(","))
+                buffer += data.decode()
+                while '\n' in buffer:
+                    message, buffer = buffer.split('\n', 1)
+                    message = message.strip()
+                    if message:
+                        self.process_message(message)
+            except Exception as e:
+                print(f"Error al manejar datos del cliente: {e}")
+                break
+        client_socket.close()
+        with self.client_lock:
+            if self.client_socket == client_socket:
+                self.client_socket = None
+
+    def process_message(self, message):
+        # Procesar el mensaje basado en su tipo (DATA o STATS)
+        if message.startswith("DATA"):
+            try:
+                _, temp_str, hum_str = message.split()
+                temperature = float(temp_str)
+                humidity = float(hum_str)
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.db.insert_data(timestamp, temperature, humidity)
                 print(f"Datos recibidos: Temperatura={temperature}C, Humedad={humidity}%")
                 self.update_callback()
             except Exception as e:
-                print(f"Error al manejar datos del cliente: {e}")
-                break
-        client_socket.close()
+                print(f"Error al procesar DATA: {e}")
+        elif message.startswith("STATS"):
+            try:
+                parts = message.split()
+                if len(parts) == 7:
+                    _, temp_avg, temp_max, temp_min, hum_avg, hum_max, hum_min = parts
+                    # Puedes almacenar estos datos o mostrarlos
+                    print(f"Datos procesados recibidos:")
+                    print(f"  Temp Promedio={temp_avg}C, Temp Max={temp_max}C, Temp Min={temp_min}C")
+                    print(f"  Hum Promedio={hum_avg}%, Hum Max={hum_max}%, Hum Min={hum_min}%")
+                    # Almacenar el promedio en la base de datos
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    temperature = float(temp_avg)
+                    humidity = float(hum_avg)
+                    self.db.insert_data(timestamp, temperature, humidity)
+                    self.update_callback()
+                else:
+                    print("Mensaje STATS con formato incorrecto")
+            except Exception as e:
+                print(f"Error al procesar STATS: {e}")
+        else:
+            print(f"Mensaje desconocido: {message}")
+
+    def send_command(self, command):
+        with self.client_lock:
+            if self.client_socket:
+                try:
+                    self.client_socket.sendall(command.encode() + b'\n')
+                    print(f"Comando enviado: {command}")
+                except Exception as e:
+                    print(f"Error al enviar comando: {e}")
+            else:
+                print("No hay cliente conectado para enviar comandos.")
 
     def stop(self):
         self.running = False
         self.server_socket.close()
+        with self.client_lock:
+            if self.client_socket:
+                self.client_socket.close()
 
 # Clase principal de la interfaz grafica
 class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
-    def __init__(self, db):
+    def __init__(self, db, server):
         super().__init__()
         self.db = db
+        self.server = server
         self.setWindowTitle("Monitor de Temperatura y Humedad")
         self.setGeometry(100, 100, 800, 600)
 
@@ -102,7 +165,7 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         # Layout principal dividido en dos columnas
         self.main_layout = QtWidgets.QHBoxLayout(self.central_widget)
 
-        # Layout izquierdo para los valores numericos
+        # Layout izquierdo para los valores numericos y controles
         self.left_layout = QtWidgets.QVBoxLayout()
 
         # Grupo para mostrar lecturas numericas
@@ -115,7 +178,7 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.n2Humedad = QtWidgets.QLCDNumber()
         self.n2Humedad.setSegmentStyle(QtWidgets.QLCDNumber.Flat)
 
-        # Anadir los LCDs al layout del grupo
+        # Añadir los LCDs al layout del grupo
         self.sensorLayout.addWidget(QtWidgets.QLabel("Temperatura (C)"))
         self.sensorLayout.addWidget(self.n1Temperatura)
         self.sensorLayout.addWidget(QtWidgets.QLabel("Humedad (%)"))
@@ -124,18 +187,56 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.sensorGroup.setLayout(self.sensorLayout)
         self.left_layout.addWidget(self.sensorGroup)
 
-        # Anadir la seccion de la izquierda al layout principal
+        # Añadir controles
+        self.controlGroup = QtWidgets.QGroupBox("Controles")
+        self.controlLayout = QtWidgets.QVBoxLayout()
+
+        self.startButton = QtWidgets.QPushButton("Iniciar Monitoreo")
+        self.startButton.clicked.connect(self.start_monitoring)
+        self.stopButton = QtWidgets.QPushButton("Detener Monitoreo")
+        self.stopButton.clicked.connect(self.stop_monitoring)
+
+        self.mode1Button = QtWidgets.QPushButton("Modo 1 (Datos en Bruto)")
+        self.mode1Button.clicked.connect(self.set_mode1)
+        self.mode2Button = QtWidgets.QPushButton("Modo 2 (Datos Procesados)")
+        self.mode2Button.clicked.connect(self.set_mode2)
+
+        self.freqLabel = QtWidgets.QLabel("Frecuencia de Muestreo (ms):")
+        self.freqInput = QtWidgets.QSpinBox()
+        self.freqInput.setRange(100, 10000)
+        self.freqInput.setValue(1000)
+        self.freqButton = QtWidgets.QPushButton("Establecer Frecuencia")
+        self.freqButton.clicked.connect(self.set_frequency)
+
+        self.windowLabel = QtWidgets.QLabel("Ventana de Tiempo (ms):")
+        self.windowInput = QtWidgets.QSpinBox()
+        self.windowInput.setRange(1000, 60000)
+        self.windowInput.setValue(5000)
+        self.windowButton = QtWidgets.QPushButton("Establecer Ventana")
+        self.windowButton.clicked.connect(self.set_window)
+
+        # Añadir controles al layout
+        self.controlLayout.addWidget(self.startButton)
+        self.controlLayout.addWidget(self.stopButton)
+        self.controlLayout.addWidget(self.mode1Button)
+        self.controlLayout.addWidget(self.mode2Button)
+        self.controlLayout.addWidget(self.freqLabel)
+        self.controlLayout.addWidget(self.freqInput)
+        self.controlLayout.addWidget(self.freqButton)
+        self.controlLayout.addWidget(self.windowLabel)
+        self.controlLayout.addWidget(self.windowInput)
+        self.controlLayout.addWidget(self.windowButton)
+
+        self.controlGroup.setLayout(self.controlLayout)
+        self.left_layout.addWidget(self.controlGroup)
+
+        # Añadir la seccion de la izquierda al layout principal
         self.main_layout.addLayout(self.left_layout)
 
-        # Area de graficos en la seccion derecha (solo dos graficos: temperatura y humedad)
+        # Area de graficos en la seccion derecha (dos graficos: temperatura y humedad)
         self.figure, self.axs = plt.subplots(2, 1, figsize=(8, 10), sharex=True)
         self.canvas = FigureCanvas(self.figure)
         self.main_layout.addWidget(self.canvas, stretch=3)
-
-        # Boton para actualizar los datos manualmente
-        self.updateButton = QtWidgets.QPushButton("Actualizar Datos")
-        self.updateButton.clicked.connect(self.actualizar_datos)
-        self.left_layout.addWidget(self.updateButton)
 
         # Timer para actualizar los datos automaticamente cada 2 segundos
         self.timer = QtCore.QTimer(self)
@@ -145,9 +246,29 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         # Actualizar los datos inicialmente al iniciar la aplicacion
         self.actualizar_datos()
 
+    def start_monitoring(self):
+        self.server.send_command("START")
+
+    def stop_monitoring(self):
+        self.server.send_command("STOP")
+
+    def set_mode1(self):
+        self.server.send_command("MODE1")
+
+    def set_mode2(self):
+        self.server.send_command("MODE2")
+
+    def set_frequency(self):
+        freq = self.freqInput.value()
+        self.server.send_command(f"SET_FREQ {freq}")
+
+    def set_window(self):
+        window = self.windowInput.value()
+        self.server.send_command(f"SET_WINDOW {window}")
+
     def actualizar_datos(self):
         # Obtener los datos de la base de datos
-        data_list = self.db.fetch_last_data(10)
+        data_list = self.db.fetch_last_data(20)  # Obtener los ultimos 20 datos
 
         # Actualizar los valores de los LCDs
         if data_list:
@@ -168,14 +289,14 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
             self.canvas.draw()
             return
 
-        # Preparar datos para graficar (solo dos graficos: temperatura y humedad)
+        # Preparar datos para graficar (dos graficos: temperatura y humedad)
         timestamps = [datetime.datetime.strptime(entry[0], "%Y-%m-%d %H:%M:%S") for entry in data_list]
         temperaturas = [entry[1] for entry in data_list]
         humedades = [entry[2] for entry in data_list]
 
         # Crear subplots
-        self.axs[0].plot(timestamps, temperaturas, label='Temp (C)', color='r')
-        self.axs[0].set_ylabel('Temp (C)')
+        self.axs[0].plot(timestamps, temperaturas, label='Temperatura (C)', color='r')
+        self.axs[0].set_ylabel('Temperatura (C)')
         self.axs[0].legend()
         self.axs[0].grid(True)
 
@@ -183,6 +304,10 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.axs[1].set_ylabel('Humedad (%)')
         self.axs[1].legend()
         self.axs[1].grid(True)
+
+        # Formato de fechas en el eje x
+        self.axs[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        self.figure.autofmt_xdate()
 
         self.figure.tight_layout()
         self.canvas.draw()
@@ -193,13 +318,14 @@ if __name__ == "__main__":
     # Inicializar la base de datos
     db = DataBase(DB_FILE)
 
-    # Crear e iniciar la aplicacion grafica
-    main_window = TemperatureHumidityMonitorApp(db)
-    main_window.show()
-
     # Iniciar el servidor TCP en un hilo separado
-    server = TCPServer(db, main_window.actualizar_datos)
+    server = TCPServer(db, None)  # Estableceremos el callback despues
+
+    # Crear e iniciar la aplicacion grafica
+    main_window = TemperatureHumidityMonitorApp(db, server)
+    server.update_callback = main_window.actualizar_datos
     server.start()
+    main_window.show()
 
     # Manejar el cierre del programa
     try:
