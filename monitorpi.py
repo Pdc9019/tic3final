@@ -32,24 +32,34 @@ class DataBase:
             CREATE TABLE IF NOT EXISTS SensorData (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
-                temperature REAL NOT NULL,
-                humidity REAL NOT NULL
+                temperature REAL,
+                humidity REAL,
+                temp_avg REAL,
+                temp_max REAL,
+                temp_min REAL,
+                hum_avg REAL,
+                hum_max REAL,
+                hum_min REAL,
+                mode INTEGER NOT NULL
             )
         ''')
         self.conn.commit()
 
-    def insert_data(self, timestamp, temperature, humidity):
+    def insert_data(self, timestamp, temperature, humidity, temp_avg=None, temp_max=None, temp_min=None,
+                    hum_avg=None, hum_max=None, hum_min=None, mode=1):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO SensorData (timestamp, temperature, humidity)
-            VALUES (?, ?, ?)
-        ''', (timestamp, temperature, humidity))
+            INSERT INTO SensorData (timestamp, temperature, humidity, temp_avg, temp_max, temp_min,
+                                    hum_avg, hum_max, hum_min, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, temperature, humidity, temp_avg, temp_max, temp_min, hum_avg, hum_max, hum_min, mode))
         self.conn.commit()
 
     def fetch_last_data(self, limit=20):
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT timestamp, temperature, humidity FROM SensorData
+            SELECT timestamp, temperature, humidity, temp_avg, temp_max, temp_min,
+                   hum_avg, hum_max, hum_min, mode FROM SensorData
             ORDER BY id DESC LIMIT ?
         ''', (limit,))
         return cursor.fetchall()[::-1]  # Revertir para orden cronologico
@@ -70,7 +80,7 @@ class TCPServer(threading.Thread):
         print(f"Servidor TCP escuchando en {SERVER_IP}:{SERVER_PORT}")
         while self.running:
             client_socket, client_address = self.server_socket.accept()
-            print(f"Conexion aceptada de {client_address}")
+            print(f"Conexión aceptada de {client_address}")
             with self.client_lock:
                 self.client_socket = client_socket
             threading.Thread(target=self.handle_client, args=(client_socket,)).start()
@@ -104,8 +114,8 @@ class TCPServer(threading.Thread):
                 temperature = float(temp_str)
                 humidity = float(hum_str)
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # En lugar de insertar en la base de datos, ponemos los datos en la cola
-                self.data_queue.put((timestamp, temperature, humidity))
+                # Ponemos los datos en la cola, mode=1 para datos en bruto
+                self.data_queue.put((timestamp, temperature, humidity, None, None, None, None, None, None, 1))
                 print(f"Datos recibidos: Temperatura={temperature}C, Humedad={humidity}%")
             except Exception as e:
                 print(f"Error al procesar DATA: {e}")
@@ -114,15 +124,18 @@ class TCPServer(threading.Thread):
                 parts = message.split()
                 if len(parts) == 7:
                     _, temp_avg, temp_max, temp_min, hum_avg, hum_max, hum_min = parts
-                    # Puedes almacenar estos datos o mostrarlos
+                    temp_avg = float(temp_avg)
+                    temp_max = float(temp_max)
+                    temp_min = float(temp_min)
+                    hum_avg = float(hum_avg)
+                    hum_max = float(hum_max)
+                    hum_min = float(hum_min)
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # Ponemos los datos en la cola, mode=2 para datos procesados
+                    self.data_queue.put((timestamp, None, None, temp_avg, temp_max, temp_min, hum_avg, hum_max, hum_min, 2))
                     print(f"Datos procesados recibidos:")
                     print(f"  Temp Promedio={temp_avg}C, Temp Max={temp_max}C, Temp Min={temp_min}C")
                     print(f"  Hum Promedio={hum_avg}%, Hum Max={hum_max}%, Hum Min={hum_min}%")
-                    # Por simplicidad, almacenamos el promedio en la base de datos
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    temperature = float(temp_avg)
-                    humidity = float(hum_avg)
-                    self.data_queue.put((timestamp, temperature, humidity))
                 else:
                     print("Mensaje STATS con formato incorrecto")
             except Exception as e:
@@ -148,7 +161,7 @@ class TCPServer(threading.Thread):
             if self.client_socket:
                 self.client_socket.close()
 
-# Clase principal de la interfaz grafica
+# Clase principal de la interfaz gráfica
 class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
     def __init__(self, db, server, data_queue):
         super().__init__()
@@ -156,7 +169,7 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.server = server
         self.data_queue = data_queue
         self.setWindowTitle("Monitor de Temperatura y Humedad")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 1000, 600)  # Aumentamos el ancho para acomodar nuevos elementos
 
         # Widget principal
         self.central_widget = QtWidgets.QWidget()
@@ -165,12 +178,12 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         # Layout principal dividido en dos columnas
         self.main_layout = QtWidgets.QHBoxLayout(self.central_widget)
 
-        # Layout izquierdo para los valores numericos y controles
+        # Layout izquierdo para los valores numéricos y controles
         self.left_layout = QtWidgets.QVBoxLayout()
 
-        # Grupo para mostrar lecturas numericas
+        # Grupo para mostrar lecturas numéricas
         self.sensorGroup = QtWidgets.QGroupBox("Lecturas de Temperatura y Humedad")
-        self.sensorLayout = QtWidgets.QVBoxLayout()
+        self.sensorLayout = QtWidgets.QGridLayout()  # Cambiamos a GridLayout para acomodar más elementos
 
         # LCDs para mostrar valores de temperatura y humedad
         self.n1Temperatura = QtWidgets.QLCDNumber()
@@ -178,11 +191,40 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.n2Humedad = QtWidgets.QLCDNumber()
         self.n2Humedad.setSegmentStyle(QtWidgets.QLCDNumber.Flat)
 
-        # Añadir los LCDs al layout del grupo
-        self.sensorLayout.addWidget(QtWidgets.QLabel("Temperatura (C)"))
-        self.sensorLayout.addWidget(self.n1Temperatura)
-        self.sensorLayout.addWidget(QtWidgets.QLabel("Humedad (%)"))
-        self.sensorLayout.addWidget(self.n2Humedad)
+        # Etiquetas y LCDs para valores promedio, máximo y mínimo
+        self.temp_avg_label = QtWidgets.QLabel("Temp Promedio (C)")
+        self.temp_avg_display = QtWidgets.QLCDNumber()
+        self.temp_max_label = QtWidgets.QLabel("Temp Máxima (C)")
+        self.temp_max_display = QtWidgets.QLCDNumber()
+        self.temp_min_label = QtWidgets.QLabel("Temp Mínima (C)")
+        self.temp_min_display = QtWidgets.QLCDNumber()
+
+        self.hum_avg_label = QtWidgets.QLabel("Hum Promedio (%)")
+        self.hum_avg_display = QtWidgets.QLCDNumber()
+        self.hum_max_label = QtWidgets.QLabel("Hum Máxima (%)")
+        self.hum_max_display = QtWidgets.QLCDNumber()
+        self.hum_min_label = QtWidgets.QLabel("Hum Mínima (%)")
+        self.hum_min_display = QtWidgets.QLCDNumber()
+
+        # Añadir los LCDs y etiquetas al layout del grupo
+        self.sensorLayout.addWidget(QtWidgets.QLabel("Temperatura Actual (C)"), 0, 0)
+        self.sensorLayout.addWidget(self.n1Temperatura, 0, 1)
+        self.sensorLayout.addWidget(QtWidgets.QLabel("Humedad Actual (%)"), 1, 0)
+        self.sensorLayout.addWidget(self.n2Humedad, 1, 1)
+
+        self.sensorLayout.addWidget(self.temp_avg_label, 2, 0)
+        self.sensorLayout.addWidget(self.temp_avg_display, 2, 1)
+        self.sensorLayout.addWidget(self.temp_max_label, 3, 0)
+        self.sensorLayout.addWidget(self.temp_max_display, 3, 1)
+        self.sensorLayout.addWidget(self.temp_min_label, 4, 0)
+        self.sensorLayout.addWidget(self.temp_min_display, 4, 1)
+
+        self.sensorLayout.addWidget(self.hum_avg_label, 5, 0)
+        self.sensorLayout.addWidget(self.hum_avg_display, 5, 1)
+        self.sensorLayout.addWidget(self.hum_max_label, 6, 0)
+        self.sensorLayout.addWidget(self.hum_max_display, 6, 1)
+        self.sensorLayout.addWidget(self.hum_min_label, 7, 0)
+        self.sensorLayout.addWidget(self.hum_min_display, 7, 1)
 
         self.sensorGroup.setLayout(self.sensorLayout)
         self.left_layout.addWidget(self.sensorGroup)
@@ -230,21 +272,25 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         self.controlGroup.setLayout(self.controlLayout)
         self.left_layout.addWidget(self.controlGroup)
 
-        # Añadir la seccion de la izquierda al layout principal
+        # Añadir la sección de la izquierda al layout principal
         self.main_layout.addLayout(self.left_layout)
 
-        # Area de graficos en la seccion derecha (dos graficos: temperatura y humedad)
+        # Área de gráficos en la sección derecha (dos gráficos: temperatura y humedad)
         self.figure, self.axs = plt.subplots(2, 1, figsize=(8, 10), sharex=True)
         self.canvas = FigureCanvas(self.figure)
         self.main_layout.addWidget(self.canvas, stretch=3)
 
-        # Timer para procesar la cola y actualizar los datos automaticamente cada 2 segundos
+        # Timer para procesar la cola y actualizar los datos automáticamente cada 2 segundos
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.process_data_queue)
         self.timer.start(2000)  # Actualizar cada 2 segundos
 
-        # Actualizar los datos inicialmente al iniciar la aplicacion
+        # Actualizar los datos inicialmente al iniciar la aplicación
         self.actualizar_datos()
+
+        # Variables para almacenar los valores internos
+        self.internal_temps = []
+        self.internal_hums = []
 
     def start_monitoring(self):
         self.server.send_command("START")
@@ -270,9 +316,41 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
         # Procesa todos los elementos en la cola
         while not self.data_queue.empty():
             try:
-                timestamp, temperature, humidity = self.data_queue.get_nowait()
-                # Inserta los datos en la base de datos
-                self.db.insert_data(timestamp, temperature, humidity)
+                data = self.data_queue.get_nowait()
+                timestamp = data[0]
+                mode = data[-1]
+                if mode == 1:
+                    # Datos en bruto
+                    temperature = data[1]
+                    humidity = data[2]
+                    # Añadir a las listas internas
+                    self.internal_temps.append(temperature)
+                    self.internal_hums.append(humidity)
+                    # Limitar el tamaño de las listas internas
+                    if len(self.internal_temps) > 100:
+                        self.internal_temps.pop(0)
+                    if len(self.internal_hums) > 100:
+                        self.internal_hums.pop(0)
+                    # Insertar en la base de datos
+                    self.db.insert_data(timestamp, temperature, humidity, mode=1)
+                elif mode == 2:
+                    # Datos procesados
+                    temp_avg = data[3]
+                    temp_max = data[4]
+                    temp_min = data[5]
+                    hum_avg = data[6]
+                    hum_max = data[7]
+                    hum_min = data[8]
+                    # Insertar en la base de datos
+                    self.db.insert_data(timestamp, None, None, temp_avg, temp_max, temp_min,
+                                        hum_avg, hum_max, hum_min, mode=2)
+                    # Mostrar los valores enviados por el ESP32
+                    self.temp_avg_display.display(temp_avg)
+                    self.temp_max_display.display(temp_max)
+                    self.temp_min_display.display(temp_min)
+                    self.hum_avg_display.display(hum_avg)
+                    self.hum_max_display.display(hum_max)
+                    self.hum_min_display.display(hum_min)
             except queue.Empty:
                 break
         # Después de procesar los datos, actualiza la interfaz
@@ -280,15 +358,40 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
 
     def actualizar_datos(self):
         # Obtener los datos de la base de datos
-        data_list = self.db.fetch_last_data(20)  # Obtener los ultimos 20 datos
+        data_list = self.db.fetch_last_data(20)  # Obtener los últimos 20 datos
 
         # Actualizar los valores de los LCDs
         if data_list:
-            ultimo_dato = data_list[-1]
-            self.n1Temperatura.display(ultimo_dato[1])
-            self.n2Humedad.display(ultimo_dato[2])
+            for data in data_list:
+                mode = data[-1]
+                if mode == 1:
+                    # Datos en bruto
+                    self.n1Temperatura.display(data[1])
+                    self.n2Humedad.display(data[2])
+                elif mode == 2:
+                    # Datos procesados (ya mostrados en process_data_queue)
+                    pass
 
-            # Actualizar graficos
+            # Calcular valores internos promedio, máximo y mínimo
+            if self.internal_temps:
+                internal_temp_avg = sum(self.internal_temps) / len(self.internal_temps)
+                internal_temp_max = max(self.internal_temps)
+                internal_temp_min = min(self.internal_temps)
+
+                self.temp_avg_label.setText(f"Temp Promedio (C) (Int: {internal_temp_avg:.2f})")
+                self.temp_max_label.setText(f"Temp Máxima (C) (Int: {internal_temp_max:.2f})")
+                self.temp_min_label.setText(f"Temp Mínima (C) (Int: {internal_temp_min:.2f})")
+
+            if self.internal_hums:
+                internal_hum_avg = sum(self.internal_hums) / len(self.internal_hums)
+                internal_hum_max = max(self.internal_hums)
+                internal_hum_min = min(self.internal_hums)
+
+                self.hum_avg_label.setText(f"Hum Promedio (%) (Int: {internal_hum_avg:.2f})")
+                self.hum_max_label.setText(f"Hum Máxima (%) (Int: {internal_hum_max:.2f})")
+                self.hum_min_label.setText(f"Hum Mínima (%) (Int: {internal_hum_min:.2f})")
+
+            # Actualizar gráficos
             self.graficar_datos(data_list)
 
     def graficar_datos(self, data_list):
@@ -301,18 +404,35 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
             self.canvas.draw()
             return
 
-        # Preparar datos para graficar (dos graficos: temperatura y humedad)
-        timestamps = [datetime.datetime.strptime(entry[0], "%Y-%m-%d %H:%M:%S") for entry in data_list]
-        temperaturas = [entry[1] for entry in data_list]
-        humedades = [entry[2] for entry in data_list]
+        # Preparar datos para graficar (temperatura y humedad)
+        timestamps = []
+        temperaturas = []
+        humedades = []
+
+        for entry in data_list:
+            timestamp = datetime.datetime.strptime(entry[0], "%Y-%m-%d %H:%M:%S")
+            mode = entry[-1]
+            if mode == 1:
+                # Datos en bruto
+                temp = entry[1]
+                hum = entry[2]
+            elif mode == 2:
+                # Datos procesados (usamos el promedio)
+                temp = entry[3]
+                hum = entry[6]
+            else:
+                continue
+            timestamps.append(timestamp)
+            temperaturas.append(temp)
+            humedades.append(hum)
 
         # Crear subplots
-        self.axs[0].plot(timestamps, temperaturas, label='Temperatura (C)', color='r')
+        self.axs[0].plot(timestamps, temperaturas, label='Temperatura (C)', color='r', marker='o')
         self.axs[0].set_ylabel('Temperatura (C)')
         self.axs[0].legend()
         self.axs[0].grid(True)
 
-        self.axs[1].plot(timestamps, humedades, label='Humedad (%)', color='b')
+        self.axs[1].plot(timestamps, humedades, label='Humedad (%)', color='b', marker='o')
         self.axs[1].set_ylabel('Humedad (%)')
         self.axs[1].legend()
         self.axs[1].grid(True)
@@ -323,6 +443,11 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
 
         self.figure.tight_layout()
         self.canvas.draw()
+
+    def closeEvent(self, event):
+        # Al cerrar la ventana, detener el servidor
+        self.server.stop()
+        event.accept()
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
