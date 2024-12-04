@@ -8,6 +8,7 @@ matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import queue
+import signal
 
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -70,6 +71,8 @@ class TCPServer(threading.Thread):
         threading.Thread.__init__(self)
         self.data_queue = data_queue
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Permitir reutilización de la dirección
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((SERVER_IP, SERVER_PORT))
         self.server_socket.listen(1)
         self.running = True
@@ -79,15 +82,20 @@ class TCPServer(threading.Thread):
     def run(self):
         print(f"Servidor TCP escuchando en {SERVER_IP}:{SERVER_PORT}")
         while self.running:
-            client_socket, client_address = self.server_socket.accept()
-            print(f"Conexión aceptada de {client_address}")
-            with self.client_lock:
-                self.client_socket = client_socket
-            threading.Thread(target=self.handle_client, args=(client_socket,)).start()
+            try:
+                client_socket, client_address = self.server_socket.accept()
+                print(f"Conexión aceptada de {client_address}")
+                with self.client_lock:
+                    self.client_socket = client_socket
+                threading.Thread(target=self.handle_client, args=(client_socket,)).start()
+            except Exception as e:
+                if self.running:
+                    print(f"Error en accept(): {e}")
+                break
 
     def handle_client(self, client_socket):
         buffer = ""
-        while True:
+        while self.running:
             try:
                 data = client_socket.recv(BUFFER_SIZE)
                 if not data:
@@ -99,7 +107,8 @@ class TCPServer(threading.Thread):
                     if message:
                         self.process_message(message)
             except Exception as e:
-                print(f"Error al manejar datos del cliente: {e}")
+                if self.running:
+                    print(f"Error al manejar datos del cliente: {e}")
                 break
         client_socket.close()
         with self.client_lock:
@@ -156,10 +165,19 @@ class TCPServer(threading.Thread):
 
     def stop(self):
         self.running = False
-        self.server_socket.close()
         with self.client_lock:
             if self.client_socket:
-                self.client_socket.close()
+                try:
+                    self.client_socket.shutdown(socket.SHUT_RDWR)
+                    self.client_socket.close()
+                except Exception as e:
+                    print(f"Error al cerrar el socket del cliente: {e}")
+                self.client_socket = None
+        try:
+            self.server_socket.shutdown(socket.SHUT_RDWR)
+        except Exception as e:
+            print(f"Error al cerrar el socket del servidor: {e}")
+        self.server_socket.close()
 
 # Clase principal de la interfaz gráfica
 class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
@@ -452,6 +470,15 @@ class TemperatureHumidityMonitorApp(QtWidgets.QMainWindow):
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
 
+    # Verificar si el puerto está en uso
+    def is_port_in_use(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('localhost', port)) == 0
+
+    if is_port_in_use(SERVER_PORT):
+        print(f"El puerto {SERVER_PORT} ya está en uso. Por favor, cierra otras instancias del programa.")
+        sys.exit(1)
+
     # Inicializar la base de datos
     db = DataBase(DB_FILE)
 
@@ -466,9 +493,17 @@ if __name__ == "__main__":
     main_window = TemperatureHumidityMonitorApp(db, server, data_queue)
     main_window.show()
 
-    # Manejar el cierre del programa
+    # Manejar el cierre del programa con señales
+    def signal_handler(sig, frame):
+        print("Interrupción recibida, cerrando el servidor...")
+        server.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
     try:
         sys.exit(app.exec_())
     except SystemExit:
         print("Cerrando aplicación...")
+    finally:
         server.stop()
